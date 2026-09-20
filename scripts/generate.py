@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Download EasyList ad-server rules and convert them to domain rule files.
+"""Download EasyList-family rules and convert them to domain rule files.
 
-Outputs (written to <repo>/rules/):
-  easy.json  - sing-box rule-set source (version 5, domain_suffix)
-  easy.list  - one "DOMAIN-SUFFIX,<domain>" per line
+For every source in SOURCES, two files are written to <repo>/rules/:
+  <name>.json  - sing-box rule-set source (version 5, domain_suffix)
+  <name>.list  - one "DOMAIN-SUFFIX,<domain>" per line
 
 Usage:
-  python scripts/generate.py                 # download from SOURCE_URL
-  python scripts/generate.py path/to/file    # use a local copy (for testing)
+  python scripts/generate.py                        # all sources, downloaded
+  python scripts/generate.py easy                   # only the named source(s)
+  python scripts/generate.py easy=./local.txt       # use a local file (testing)
+
+To add another EasyList-format list, just add one entry to SOURCES.
 
 Extraction philosophy (so upstream changes don't break it):
   * Structure-based, not position-based: every line is classified on its own,
     so added/removed/reordered rules, new comments, CRLF, BOM, spaces,
     upper-case and IDN domains are all handled.
+  * @@ exceptions that fully unblock a domain remove it from the output;
+    partial ones (domain=, script, generichide...) are ignored.
   * Fail-safe: only rules that clearly mean "block this whole domain" are kept.
     Anything unrecognised (unknown options, paths, wildcards, ports, regex...)
     is skipped rather than guessed.
@@ -28,10 +33,12 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-SOURCE_URL = (
-    "https://raw.githubusercontent.com/easylist/easylist/master/"
-    "easylist/easylist_adservers.txt"
-)
+SOURCES = {
+    "easy": "https://raw.githubusercontent.com/easylist/easylist/master/"
+            "easylist/easylist_adservers.txt",
+    "easychina": "https://raw.githubusercontent.com/easylist/easylistchina/master/"
+                 "easylistchina.txt",
+}
 OUT_DIR = Path(__file__).resolve().parent.parent / "rules"
 
 # ---- sanity limits --------------------------------------------------------
@@ -110,7 +117,7 @@ def classify(line: str) -> tuple[str, str | None]:
     """Return (kind, host_or_reason).
 
     kind: "block"     -> host should be blocked
-          "exception" -> host appears in an @@ rule (used to drop it, fail-safe)
+          "exception" -> host is fully whitelisted by an @@ rule (removes the block)
           "skip"      -> ignored; second item is the reason
     """
     line = line.strip().lstrip("\ufeff")
@@ -135,11 +142,13 @@ def classify(line: str) -> tuple[str, str | None]:
             return "skip", "ip address"
         return "skip", "path/wildcard/port/partial domain"
 
-    if is_exception:
-        return "exception", host
     if sep and not options_are_safe(opts):
-        return "skip", "restrictive options (may over-block)"
-    return "block", host
+        # A block rule with narrowing options may over-block.
+        # An exception with narrowing options (domain=, script, generichide...)
+        # only unblocks part of the domain, so it must not remove the block.
+        return "skip", ("partial @@ exception (ignored)" if is_exception
+                        else "restrictive options (may over-block)")
+    return ("exception" if is_exception else "block"), host
 
 
 def extract_domains(text: str) -> tuple[list[str], Counter]:
@@ -159,43 +168,69 @@ def extract_domains(text: str) -> tuple[list[str], Counter]:
     return sorted(blocked - excepted), stats
 
 
-def previous_count() -> int:
-    path = OUT_DIR / "easy.list"
+def previous_count(name: str) -> int:
+    path = OUT_DIR / f"{name}.list"
     if not path.exists():
         return 0
     with path.open(encoding="utf-8") as f:
         return sum(1 for _ in f)
 
 
-def main() -> None:
-    if len(sys.argv) > 1:
-        text = Path(sys.argv[1]).read_text(encoding="utf-8-sig", errors="replace")
-    else:
-        text = download(SOURCE_URL)
+def build(name: str, text: str) -> None:
+    """Extract domains from `text` and write <name>.json / <name>.list.
 
+    Raises RuntimeError (leaving existing output untouched) if the result
+    looks broken.
+    """
     domains, stats = extract_domains(text)
 
-    print(f"extracted {len(domains)} domains; skipped/dropped:")
+    print(f"[{name}] extracted {len(domains)} domains; skipped/dropped:")
     for reason, n in stats.most_common():
         print(f"  {n:>6}  {reason}")
 
     if len(domains) < MIN_EXPECTED_DOMAINS:
-        sys.exit(f"only {len(domains)} domains extracted; refusing to overwrite rules")
-    old = previous_count()
+        raise RuntimeError(f"only {len(domains)} domains extracted; refusing to overwrite rules")
+    old = previous_count(name)
     if (old and len(domains) < old * MAX_SHRINK_RATIO
             and os.environ.get("ALLOW_SHRINK") != "1"):
-        sys.exit(f"domains dropped from {old} to {len(domains)}; upstream format "
-                 f"may have changed. Check the source, or set ALLOW_SHRINK=1.")
+        raise RuntimeError(f"domains dropped from {old} to {len(domains)}; upstream format "
+                           f"may have changed. Check the source, or set ALLOW_SHRINK=1.")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     ruleset = {"version": 5, "rules": [{"domain_suffix": domains}]}
-    (OUT_DIR / "easy.json").write_text(
+    (OUT_DIR / f"{name}.json").write_text(
         json.dumps(ruleset, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    (OUT_DIR / "easy.list").write_text(
+    (OUT_DIR / f"{name}.list").write_text(
         "".join(f"DOMAIN-SUFFIX,{d}\n" for d in domains), encoding="utf-8"
     )
-    print(f"wrote {len(domains)} domains to {OUT_DIR}")
+    print(f"[{name}] wrote {len(domains)} domains to {OUT_DIR}")
+
+
+def main() -> None:
+    # args: "name" or "name=local_file"; no args => every source
+    requested: dict[str, str | None] = {}
+    for arg in sys.argv[1:]:
+        name, _, path = arg.partition("=")
+        if name not in SOURCES:
+            sys.exit(f"unknown source '{name}'; choose from: {', '.join(SOURCES)}")
+        requested[name] = path or None
+    if not requested:
+        requested = {name: None for name in SOURCES}
+
+    failed = []
+    for name, local_path in requested.items():
+        try:
+            if local_path:
+                text = Path(local_path).read_text(encoding="utf-8-sig", errors="replace")
+            else:
+                text = download(SOURCES[name])
+            build(name, text)
+        except Exception as exc:  # noqa: BLE001 - keep going so other sources still update
+            print(f"[{name}] FAILED: {exc}", file=sys.stderr)
+            failed.append(name)
+    if failed:
+        sys.exit(f"failed sources: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
