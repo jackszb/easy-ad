@@ -33,16 +33,24 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
+# name -> (url, minimum plausible number of domains)
+# The minimum is a sanity check: fewer than this means the download or the
+# parsing is broken, so the existing output is left untouched.
 SOURCES = {
-    "easy": "https://raw.githubusercontent.com/easylist/easylist/master/"
-            "easylist/easylist_adservers.txt",
-    "easychina": "https://raw.githubusercontent.com/easylist/easylistchina/master/"
-                 "easylistchina.txt",
+    "easy": (
+        "https://raw.githubusercontent.com/easylist/easylist/master/"
+        "easylist/easylist_adservers.txt", 1000),
+    "easychina": (
+        "https://raw.githubusercontent.com/easylist/easylistchina/master/"
+        "easylistchina.txt", 1000),
+    "chinesefilter": (
+        "https://adguardteam.github.io/AdguardFilters/ChineseFilter/"
+        "sections/adservers.txt", 100),
 }
 OUT_DIR = Path(__file__).resolve().parent.parent / "rules"
 
 # ---- sanity limits --------------------------------------------------------
-MIN_EXPECTED_DOMAINS = 1000   # fewer than this => download/parse is broken
+# (per-source minimum lives in SOURCES)
 MAX_SHRINK_RATIO = 0.5        # new < 50% of previous output => refuse
                               # (set ALLOW_SHRINK=1 to override deliberately)
 
@@ -176,7 +184,7 @@ def previous_count(name: str) -> int:
         return sum(1 for _ in f)
 
 
-def build(name: str, text: str) -> None:
+def build(name: str, text: str, min_domains: int) -> None:
     """Extract domains from `text` and write <name>.json / <name>.list.
 
     Raises RuntimeError (leaving existing output untouched) if the result
@@ -188,7 +196,7 @@ def build(name: str, text: str) -> None:
     for reason, n in stats.most_common():
         print(f"  {n:>6}  {reason}")
 
-    if len(domains) < MIN_EXPECTED_DOMAINS:
+    if len(domains) < min_domains:
         raise RuntimeError(f"only {len(domains)} domains extracted; refusing to overwrite rules")
     old = previous_count(name)
     if (old and len(domains) < old * MAX_SHRINK_RATIO
@@ -224,8 +232,8 @@ def main() -> None:
             if local_path:
                 text = Path(local_path).read_text(encoding="utf-8-sig", errors="replace")
             else:
-                text = download(SOURCES[name])
-            build(name, text)
+                text = download(SOURCES[name][0])
+            build(name, text, SOURCES[name][1])
         except Exception as exc:  # noqa: BLE001 - keep going so other sources still update
             print(f"[{name}] FAILED: {exc}", file=sys.stderr)
             failed.append(name)
